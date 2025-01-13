@@ -1,0 +1,215 @@
+import os
+import logging
+from datetime import datetime
+from typing import List, Optional
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.core.exceptions import AzureError
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import mimetypes
+import hashlib
+
+class AzureBlobUploader:
+    def __init__(
+        self,
+        connection_string: str,
+        container_name: str,
+        max_workers: int = 4,
+        chunk_size: int = 4 * 1024 * 1024  # 4MB chunks
+    ):
+        """
+        Initialize the Azure Blob Uploader.
+        
+        Args:
+            connection_string: Azure Storage connection string
+            container_name: Target container name
+            max_workers: Maximum number of concurrent upload workers
+            chunk_size: Size of chunks for parallel upload
+        """
+        self.connection_string = connection_string
+        self.container_name = container_name
+        self.max_workers = max_workers
+        self.chunk_size = chunk_size
+        
+        # Set up logging
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.INFO)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+
+    def _get_blob_client(self):
+        """Create and return a blob service client."""
+        try:
+            blob_service_client = BlobServiceClient.from_connection_string(
+                self.connection_string
+            )
+            container_client = blob_service_client.get_container_client(
+                self.container_name
+            )
+            return container_client
+        except AzureError as e:
+            self.logger.error(f"Failed to create blob client: {str(e)}")
+            raise
+
+    def _calculate_md5(self, file_path: str) -> str:
+        """Calculate MD5 hash of file for integrity verification."""
+        md5_hash = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b''):
+                md5_hash.update(chunk)
+        return md5_hash.hexdigest()
+
+    def _upload_single_file(
+        self,
+        local_path: str,
+        blob_path: str,
+        container_client
+    ) -> bool:
+        """
+        Upload a single file to blob storage.
+        
+        Args:
+            local_path: Path to local file
+            blob_path: Destination path in blob storage
+            container_client: Azure container client
+            
+        Returns:
+            bool: True if upload successful, False otherwise
+        """
+        try:
+            # Get file size and mime type
+            file_size = os.path.getsize(local_path)
+            content_type, _ = mimetypes.guess_type(local_path)
+            
+            # Calculate MD5 for integrity check
+            md5_hash = self._calculate_md5(local_path)
+            
+            # Set content settings
+            content_settings = ContentSettings(
+                content_type=content_type,
+                content_md5=md5_hash.encode()
+            )
+            
+            # Upload file
+            with open(local_path, 'rb') as data:
+                blob_client = container_client.get_blob_client(blob_path)
+                blob_client.upload_blob(
+                    data,
+                    blob_type="BlockBlob",
+                    content_settings=content_settings,
+                    overwrite=True,
+                    max_concurrency=self.max_workers,
+                    chunk_size=self.chunk_size
+                )
+            
+            self.logger.info(
+                f"Successfully uploaded {local_path} to {blob_path}"
+            )
+            return True
+            
+        except Exception as e:
+            self.logger.error(
+                f"Failed to upload {local_path}: {str(e)}"
+            )
+            return False
+
+    def upload_folder(
+        self,
+        local_folder: str,
+        blob_prefix: Optional[str] = None,
+        file_extensions: Optional[List[str]] = None
+    ) -> dict:
+        """
+        Upload all files from a local folder to Azure Blob Storage.
+        
+        Args:
+            local_folder: Path to local folder
+            blob_prefix: Prefix for blob names (default: None)
+            file_extensions: List of file extensions to upload (default: None, uploads all)
+            
+        Returns:
+            dict: Summary of upload results
+        """
+        if not os.path.exists(local_folder):
+            raise ValueError(f"Local folder {local_folder} does not exist")
+
+        # Get container client
+        container_client = self._get_blob_client()
+        
+        # Initialize counters
+        results = {
+            'total_files': 0,
+            'successful_uploads': 0,
+            'failed_uploads': 0,
+            'start_time': datetime.now(),
+            'failed_files': []
+        }
+
+        # Create a thread pool for parallel uploads
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_file = {}
+            
+            # Walk through the local folder
+            for root, _, files in os.walk(local_folder):
+                for filename in files:
+                    # Check file extension if specified
+                    if (file_extensions and not any(
+                        filename.lower().endswith(ext.lower())
+                        for ext in file_extensions
+                    )):
+                        continue
+                    
+                    local_path = os.path.join(root, filename)
+                    relative_path = os.path.relpath(local_path, local_folder)
+                    
+                    # Construct blob path
+                    blob_path = relative_path
+                    if blob_prefix:
+                        blob_path = os.path.join(blob_prefix, relative_path)
+                    
+                    # Replace backslashes with forward slashes for blob storage
+                    blob_path = blob_path.replace('\\', '/')
+                    
+                    # Submit upload task
+                    future = executor.submit(
+                        self._upload_single_file,
+                        local_path,
+                        blob_path,
+                        container_client
+                    )
+                    future_to_file[future] = local_path
+                    results['total_files'] += 1
+
+            # Process completed uploads
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                try:
+                    if future.result():
+                        results['successful_uploads'] += 1
+                    else:
+                        results['failed_uploads'] += 1
+                        results['failed_files'].append(file_path)
+                except Exception as e:
+                    self.logger.error(
+                        f"Exception occurred while uploading {file_path}: {str(e)}"
+                    )
+                    results['failed_uploads'] += 1
+                    results['failed_files'].append(file_path)
+
+        # Calculate duration
+        results['duration'] = datetime.now() - results['start_time']
+        
+        # Log summary
+        self.logger.info(
+            f"Upload completed. "
+            f"Total files: {results['total_files']}, "
+            f"Successful: {results['successful_uploads']}, "
+            f"Failed: {results['failed_uploads']}, "
+            f"Duration: {results['duration']}"
+        )
+        
+        return results
